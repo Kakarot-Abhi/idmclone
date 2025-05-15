@@ -1,119 +1,212 @@
 package com.kakarotabhi.idmclone.service;
 
-import com.kakarotabhi.idmclone.downloader.SegmentDownloader;
 import com.kakarotabhi.idmclone.entity.Download;
+import com.kakarotabhi.idmclone.entity.SegmentInfo;
+import com.kakarotabhi.idmclone.enums.DownloadStatus;
+import com.kakarotabhi.idmclone.enums.SegmentStatus;
 import com.kakarotabhi.idmclone.repository.DownloadRepository;
-import com.kakarotabhi.idmclone.task.SegmentInfo;
-import org.springframework.beans.factory.annotation.Value;
+import com.kakarotabhi.idmclone.repository.SegmentInfoRepository;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.scheduling.annotation.EnableAsync;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 
-import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
 import java.io.RandomAccessFile;
 import java.net.HttpURLConnection;
 import java.net.URL;
-import java.util.ArrayList;
+import java.time.LocalDateTime;
 import java.util.List;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicLong;
 
 @Service
+@EnableAsync
 public class DownloadService {
 
-    private final DownloadRepository downloadRepository;
-    
-    // Directory where files will be saved (configured via application.properties)
-    @Value("${download.dir:/download/IDMClone}")
-    private String downloadDir;
+    @Autowired
+    private DownloadRepository downloadRepo;
 
-    public DownloadService(DownloadRepository downloadRepository) {
-        this.downloadRepository = downloadRepository;
+    @Autowired
+    private SegmentInfoRepository segmentRepo;
+
+    // Map of downloadId -> pause flag
+    private ConcurrentMap<Long, AtomicBoolean> pauseFlags = new ConcurrentHashMap<>();
+
+    // Create and start a new download asynchronously
+    @Async
+    public void startDownload(Long downloadId) {
+        Download download = downloadRepo.findById(downloadId)
+            .orElseThrow(() -> new IllegalArgumentException("Invalid download ID"));
+        download.setStatus(DownloadStatus.DOWNLOADING);
+        download.setUpdatedAt(LocalDateTime.now());
+        downloadRepo.save(download);
+
+        // Initialize pause flag
+        pauseFlags.put(downloadId, new AtomicBoolean(false));
+
+        // Launch threads for each segment
+        List<SegmentInfo> segments = download.getSegments();
+        for (SegmentInfo seg : segments) {
+            if (seg.getStatus() != SegmentStatus.COMPLETED) {
+                // Mark as DOWNLOADING and save
+                seg.setStatus(SegmentStatus.DOWNLOADING);
+                segmentRepo.save(seg);
+
+                // Launch a new thread for this segment
+                new Thread(() -> downloadSegment(download, seg)).start();
+            }
+        }
     }
 
-    /**
-     * Starts a new download for the given URL and filename.
-     * Returns the database entity representing this download.
-     */
-    @Transactional
-    public Download startDownload(String fileUrl, String fileName) throws Exception {
-        // Save initial Download entity with status QUEUED
-        Download download = new Download();
-        download.setUrl(fileUrl);
-        download.setFileName(fileName);
-        download.setStatus("QUEUED");
-        download.setDownloadedSize(0L);
-        downloadRepository.save(download);
+    // Download logic for one segment
+    private void downloadSegment(Download download, SegmentInfo seg) {
+        long start = seg.getStartByte() + seg.getDownloadedBytes();
+        long end = seg.getEndByte();
+        String url = download.getUrl();
+        String fileName = download.getFileName();
+        AtomicBoolean pauseFlag = pauseFlags.get(download.getId());
 
-        // Perform the actual download (could be @Async for real apps)
-        performDownload(download);
+        try (RandomAccessFile output = new RandomAccessFile(fileName, "rw")) {
+            HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
+            connection.setRequestProperty("Range", "bytes=" + start + "-" + end);
+            connection.connect();
+            // Optional: check response code is 206
+            try (InputStream input = connection.getInputStream()) {
+                output.seek(start);
+                byte[] buffer = new byte[8192];
+                int bytesRead;
+                long totalRead = seg.getDownloadedBytes();
 
-        return download;
+                while ((bytesRead = input.read(buffer)) != -1) {
+                    // Check for pause
+                    if (pauseFlag.get() || download.getStatus() == DownloadStatus.PAUSED) {
+                        seg.setStatus(SegmentStatus.PAUSED);
+                        seg.setDownloadedBytes(totalRead);
+                        segmentRepo.save(seg);
+                        return; // exit thread gracefully
+                    }
+                    output.write(buffer, 0, bytesRead);
+                    totalRead += bytesRead;
+                }
+                // Segment completed
+                seg.setDownloadedBytes(totalRead);
+                seg.setStatus(SegmentStatus.COMPLETED);
+                segmentRepo.save(seg);
+
+                // After segment, check if all segments done
+                checkAndCompleteDownload(download);
+            }
+        } catch (Exception e) {
+            // On error, mark this segment as FAILED
+            seg.setStatus(SegmentStatus.FAILED);
+            segmentRepo.save(seg);
+        }
     }
 
-    private void performDownload(Download download) throws Exception {
-        download.setStatus("IN_PROGRESS");
-        downloadRepository.save(download);
+    // Pause a download: set flag and update statuses
+    public void pauseDownload(Long downloadId) {
+        Download download = downloadRepo.findById(downloadId)
+            .orElseThrow(() -> new IllegalArgumentException("Invalid download ID"));
+        download.setStatus(DownloadStatus.PAUSED);
+        downloadRepo.save(download);
 
-        // Prepare download URL and connection
-        URL url = new URL(download.getUrl());
-        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-        conn.setRequestMethod("HEAD");
-        conn.setInstanceFollowRedirects(true);
-        conn.connect();
-        long totalSize = conn.getContentLengthLong();
-        download.setTotalSize(totalSize);
-        downloadRepository.save(download);
-
-        // Prepare target file
-        File dir = new File(downloadDir);
-        if (!dir.exists()) {
-            dir.mkdirs();
+        AtomicBoolean flag = pauseFlags.get(downloadId);
+        if (flag != null) {
+            flag.set(true);
         }
-        File targetFile = new File(dir, download.getFileName());
-        try (RandomAccessFile raf = new RandomAccessFile(targetFile, "rw")) {
-            raf.setLength(totalSize);  // Pre-allocate file size
+        // Threads will detect flag and exit
+    }
+
+    // Resume a paused download: clear flag and restart incomplete segments
+    @Async
+    public void resumeDownload(Long downloadId) {
+        Download download = downloadRepo.findById(downloadId)
+            .orElseThrow(() -> new IllegalArgumentException("Invalid download ID"));
+        if (download.getStatus() != DownloadStatus.PAUSED) {
+            throw new IllegalStateException("Download is not paused");
         }
+        download.setStatus(DownloadStatus.DOWNLOADING);
+        downloadRepo.save(download);
 
-        // Create 8 segments
-        int numSegments = 8;
-        long segmentSize = totalSize / numSegments;
-        List<SegmentInfo> segments = new ArrayList<>();
-        long start = 0;
-        for (int i = 0; i < numSegments; i++) {
-            long end = (i < numSegments - 1) ? (start + segmentSize - 1) : (totalSize - 1);
-            segments.add(new SegmentInfo(i, start, end));
-            start = end + 1;
-        }
-
-        // Atomic variables for progress and error tracking
-        AtomicLong bytesDownloaded = new AtomicLong(0);
-        AtomicBoolean errorFlag = new AtomicBoolean(false);
-        CountDownLatch doneSignal = new CountDownLatch(numSegments);
-
-        // Start threads for each segment
-        ExecutorService executor = Executors.newFixedThreadPool(numSegments);
-        for (SegmentInfo segment : segments) {
-            executor.submit(new SegmentDownloader(url, targetFile, segment,
-                                                  bytesDownloaded, errorFlag, doneSignal));
-        }
-        executor.shutdown();
-        
-        // Wait for all segments to finish
-        doneSignal.await();
-
-        // Update downloaded size in DB
-        download.setDownloadedSize(bytesDownloaded.get());
-
-        if (errorFlag.get()) {
-            // If any segment failed, mark INCOMPLETE for manual retry
-            download.setStatus("INCOMPLETE");
+        AtomicBoolean flag = pauseFlags.get(downloadId);
+        if (flag != null) {
+            flag.set(false);
         } else {
-            // All segments completed successfully
-            download.setStatus("COMPLETED");
+            pauseFlags.put(downloadId, new AtomicBoolean(false));
         }
-        downloadRepository.save(download);
+        // Relaunch threads for segments that are not completed
+        List<SegmentInfo> segments = segmentRepo.findByDownloadId(downloadId);
+        for (SegmentInfo seg : segments) {
+            if (seg.getStatus() != SegmentStatus.COMPLETED) {
+                seg.setStatus(SegmentStatus.DOWNLOADING);
+                segmentRepo.save(seg);
+                new Thread(() -> downloadSegment(download, seg)).start();
+            }
+        }
+    }
+
+    // Retry download: by default retry failed segments; if full=true, reset all segments
+    @Async
+    public void retryDownload(Long downloadId, boolean fullRestart) {
+        Download download = downloadRepo.findById(downloadId)
+            .orElseThrow(() -> new IllegalArgumentException("Invalid download ID"));
+        download.setStatus(DownloadStatus.DOWNLOADING);
+        downloadRepo.save(download);
+
+        // Prepare for restart
+        if (fullRestart) {
+            // Reset file and segment offsets
+            // Truncate the file to 0 length
+            try (RandomAccessFile output = new RandomAccessFile(download.getFileName(), "rw")) {
+                output.setLength(0);
+            } catch (IOException e) {
+                // handle error
+            }
+            // Reset all segments to start and pending
+            List<SegmentInfo> segments = segmentRepo.findByDownloadId(downloadId);
+            for (SegmentInfo seg : segments) {
+                seg.setDownloadedBytes(0);
+                seg.setStatus(SegmentStatus.DOWNLOADING);
+                segmentRepo.save(seg);
+                new Thread(() -> downloadSegment(download, seg)).start();
+            }
+        } else {
+            // Retry only failed or paused segments
+            List<SegmentInfo> segments = segmentRepo.findByDownloadId(downloadId);
+            for (SegmentInfo seg : segments) {
+                if (seg.getStatus() == SegmentStatus.FAILED || seg.getStatus() == SegmentStatus.PAUSED) {
+                    seg.setStatus(SegmentStatus.DOWNLOADING);
+                    segmentRepo.save(seg);
+                    new Thread(() -> downloadSegment(download, seg)).start();
+                }
+            }
+        }
+    }
+
+    // Check if all segments are completed; if so, mark download complete
+    private synchronized void checkAndCompleteDownload(Download download) {
+        List<SegmentInfo> segments = segmentRepo.findByDownloadId(download.getId());
+        boolean allDone = segments.stream()
+                            .allMatch(seg -> seg.getStatus() == SegmentStatus.COMPLETED);
+        if (allDone) {
+            download.setStatus(DownloadStatus.COMPLETED);
+            download.setUpdatedAt(LocalDateTime.now());
+            downloadRepo.save(download);
+        }
+    }
+
+    // Get download status and progress
+    public DownloadStatus getStatus(Long downloadId) {
+        return downloadRepo.findById(downloadId)
+                .map(Download::getStatus)
+                .orElseThrow(() -> new IllegalArgumentException("Invalid download ID"));
+    }
+
+    public Download getDownload(Long downloadId) {
+        return downloadRepo.findById(downloadId)
+                .orElseThrow(() -> new IllegalArgumentException("Invalid download ID"));
     }
 }
