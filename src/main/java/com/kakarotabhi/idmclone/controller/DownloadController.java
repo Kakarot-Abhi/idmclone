@@ -142,4 +142,23 @@ public class DownloadController {
         resp.put("segments", segments);
         return ResponseEntity.ok(resp);
     }
+
+    // 1. List active downloads
+    @GetMapping
+    public ResponseEntity<List<Download>> listDownloads() {
+        return ResponseEntity.ok(downloadService.listDownloads());
+    }
+
+    // 2. List history
+    @GetMapping("/history")
+    public ResponseEntity<List<Download>> listHistory() {
+        return ResponseEntity.ok(downloadService.listHistory());
+    }
+
+    // 3. Cancel a download
+    @DeleteMapping("/{id}")
+    public ResponseEntity<?> cancel(@PathVariable Long id) {
+        downloadService.cancelDownload(id);
+        return ResponseEntity.ok("Download " + id + " cancelled");
+    }
 }

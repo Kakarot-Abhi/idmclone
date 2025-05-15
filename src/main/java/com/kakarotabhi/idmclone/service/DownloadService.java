@@ -11,6 +11,7 @@ import org.springframework.scheduling.annotation.Async;
 import org.springframework.scheduling.annotation.EnableAsync;
 import org.springframework.stereotype.Service;
 
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.RandomAccessFile;
@@ -34,6 +35,8 @@ public class DownloadService {
 
     // Map of downloadId -> pause flag
     private ConcurrentMap<Long, AtomicBoolean> pauseFlags = new ConcurrentHashMap<>();
+
+    private final ConcurrentMap<Long, AtomicBoolean> cancelFlags = new ConcurrentHashMap<>();
 
     // Create and start a new download asynchronously
     @Async
@@ -68,6 +71,7 @@ public class DownloadService {
         String url = download.getUrl();
         String fileName = download.getFileName();
         AtomicBoolean pauseFlag = pauseFlags.get(download.getId());
+        AtomicBoolean cancelFlag = cancelFlags.get(download.getId());
 
         try (RandomAccessFile output = new RandomAccessFile(fileName, "rw")) {
             HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
@@ -88,6 +92,14 @@ public class DownloadService {
                         segmentRepo.save(seg);
                         return; // exit thread gracefully
                     }
+
+                    if (cancelFlag != null && cancelFlag.get()) {
+                        // mark segment as CANCELLED
+                        seg.setStatus(SegmentStatus.FAILED);
+                        segmentRepo.save(seg);
+                        return;
+                    }
+
                     output.write(buffer, 0, bytesRead);
                     totalRead += bytesRead;
                 }
@@ -208,5 +220,43 @@ public class DownloadService {
     public Download getDownload(Long downloadId) {
         return downloadRepo.findById(downloadId)
                 .orElseThrow(() -> new IllegalArgumentException("Invalid download ID"));
+    }
+
+    /** List all downloads that are not yet completed (IN_PROGRESS, PAUSED, PENDING). */
+    public List<Download> listDownloads() {
+        return downloadRepo.findAll()
+                .stream()
+                .filter(d -> d.getStatus() == DownloadStatus.PENDING
+                        || d.getStatus() == DownloadStatus.DOWNLOADING
+                        || d.getStatus() == DownloadStatus.PAUSED)
+                .toList();
+    }
+
+    /** List history: COMPLETED, FAILED, CANCELLED. */
+    public List<Download> listHistory() {
+        return downloadRepo.findAll()
+                .stream()
+                .filter(d -> d.getStatus() == DownloadStatus.COMPLETED
+                        || d.getStatus() == DownloadStatus.FAILED
+                        || d.getStatus() == DownloadStatus.CANCELLED)
+                .toList();
+    }
+
+    /** Cancel a download: set cancel flag and update status. */
+    public void cancelDownload(Long downloadId) {
+        Download download = downloadRepo.findById(downloadId)
+                .orElseThrow(() -> new IllegalArgumentException("Invalid download ID"));
+        download.setStatus(DownloadStatus.CANCELLED);
+        downloadRepo.save(download);
+
+        // Signal cancellation
+        cancelFlags.computeIfAbsent(downloadId, id -> new AtomicBoolean())
+                .set(true);
+
+        // Delete partial file
+        File f = new File(download.getFileName());
+        if (f.exists()) {
+            f.delete();
+        }
     }
 }
