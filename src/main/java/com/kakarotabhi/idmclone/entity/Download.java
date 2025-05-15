@@ -16,7 +16,7 @@ import java.util.List;
 public class Download {
     @Id @GeneratedValue
     private Long id;
-
+    @Column(length = 5000) // or more if needed
     private String url;
     private String fileName;    // local path to save
     private long totalBytes;    // total size (optional, can set after HEAD request)
