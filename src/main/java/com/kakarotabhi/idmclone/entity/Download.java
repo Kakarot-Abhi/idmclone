@@ -20,5 +20,7 @@ public class Download {
     private String url;
     private String fileName;
     private String status;
+    private Long downloadedSize;
+    private Long totalSize;
 
 }
